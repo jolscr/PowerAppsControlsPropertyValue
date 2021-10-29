@@ -1,0 +1,117 @@
+<#
+    .SYNOPSIS
+        Exporter la valeur des propriétés des contrôles Power Apps
+		Auteur: Joël Kolly
+		
+    .DESCRIPTION
+		Enregister l'application Power Apps (Enregistrer sous) dans votre répertoire importPath puis exécuter le script avec les bons paramètres
+		Inspiré du code : https://questcequecest.com/script-powershell-pour-recuperer-automatiquement-la-valeur-des-proprietes-des-controles-power-apps
+	.EXAMPLE
+		.\Get-PropertyValue_PowerAppsControls.ps1 -importPath "C:\Temp\PVPAC\Import" -exportPath "C:\Temp\PVPAC\Export" -appName "MyAppNameWithoutMsappExtension"
+#>
+[CmdletBinding()]
+param(
+	[Parameter(Mandatory=$true)][String]$importPath="C:\Users\kollyj01\Desktop\exportControl",
+	[Parameter(Mandatory=$true)][String]$exportPath="C:\Users\kollyj01\Desktop\exportControl",
+	[Parameter(Mandatory=$true)][String]$appName="MyAppNameWithoutMsappExtension"
+)
+
+
+Clear-Host
+
+# Paramètres calculés et autres
+$exportFile = "$exportPath\$appName.csv"
+
+# Suppression des résultats des exécutions précédentes
+if (test-path $exportfile) {
+	Remove-Item -path $exportfile
+}
+if (Test-Path "$importPath\$appName.zip") {
+	Remove-Item -path "$importPath\$appName.zip"
+}
+if (Test-Path "$importPath\$appName.expand") {
+	Remove-Item -path "$importPath\$appName.expand" -Recurse
+}
+
+# Vérifier l'existence du fichier "$importPath\$appName.msapp"
+if (!(Test-Path "$importPath\$appName.msapp")) {
+	Write-Host "[HALT] $($MyInvocation.MyCommand.Name) Missing file:'$importPath\$appName.msapp' -Arrêt du programme avec erreur $($MyInvocation.MyCommand.Name) " -ForegroundColor Red
+	Sleep 3600
+	exit
+}
+
+# Décompresser le fichier compressé
+Copy-Item "$importPath\$appName.msapp" "$importPath\$appName.zip" -force
+Expand-Archive -LiteralPath "$importPath\$appName.zip" -DestinationPath "$importPath\$appName.expand"
+
+# Créer le dossier d'exportation
+if (-not(test-path -path $exportPath)) {
+New-Item $exportPath -type directory -force}
+
+# Fonction récursive
+function checkChildrenRecursiv ($Parent, $AppScreen, $Path){
+	
+	#Permettra de remplir la colonne Path correctement car un control de type IsGroupControl référence les éléments qu'ils regroupent mais ceux-ci ne sont pas dessous lui (à la différence des controls Containers)
+	#Exemple groupKV = {ctrl1:groupA ; ctrl2:groupB ; ctrl3:groupA ; ...} cela nous permettra de rajouter par exemple ...\groupA\ctrl1
+	$groupKV = @{}
+	$GroupControls = $Parent.Children | where { $_.Type -eq "ControlInfo" -and $_.IsGroupControl}
+	foreach($GroupControl in $GroupControls){
+		$GroupControl.GroupedControlsKey | foreach {
+			$groupKV.add( $_ , $GroupControl.Name )
+		}
+	}
+	
+	#Children
+	$children = $Parent.Children | where { $_.Type -eq "ControlInfo" }
+	foreach ($child in $children) {
+		$rules = $child.Rules | Select-Object Property, InvariantScript
+		$rules | ForEach-Object {
+			
+			#Si le control fait partie d'un groupement, alors on ajuste le path
+			if($groupPath = $groupKV[$child.Name]){
+				$tempPath = $Path+"\"+$groupPath
+			}else{
+				$tempPath = $Path
+			}
+			
+			$global:allObjects += [pscustomobject]@{
+				AppScreen = $AppScreen
+				Path = $tempPath
+				Control = $child.Name
+				Property = $_.Property
+				Value = $_.InvariantScript
+				IsGroupControl = $child.IsGroupControl		
+			}
+		}
+		checkChildrenRecursiv -Parent $child -AppScreen $AppScreen -Path $tempPath\$($child.Name)
+	}
+}
+
+# MAIN
+$global:allObjects = @()
+Get-ChildItem "$importPath\$appName.expand\Controls" -Name | ForEach-Object {
+	
+    $importFile = "$importPath\$appName.expand\Controls\$_"
+    $json = (Get-Content $importfile -Raw -Encoding UTF8 ) | ConvertFrom-Json
+	
+	#Parent
+    $TopParent = $json.TopParent | where { $_.Type -eq "ControlInfo" }
+	$rules = $TopParent.Rules | Select-Object Property, InvariantScript
+    $rules | ForEach-Object {
+		$global:allObjects += [pscustomobject]@{
+			AppScreen = $TopParent.Name
+			Path = $appName
+			Control = $TopParent.Name
+			Property = $_.Property
+			Value = $_.InvariantScript
+			IsGroupControl = $TopParent.IsGroupControl
+		}
+	}
+	
+	#Children
+	checkChildrenRecursiv -Parent $TopParent -AppScreen $TopParent.Name -Path $appName\$($TopParent.Name)
+}
+
+$global:allObjects | Export-Csv -Path $exportfile -NoTypeInformation -Delimiter ";" -Encoding UTF8
+
+Invoke-Item $exportPath
